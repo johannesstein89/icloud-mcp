@@ -1,7 +1,7 @@
 """FastMCP server for iCloud integration."""
 
 from fastmcp import FastMCP
-from . import calendar, contacts, email as email_module
+from . import calendar, contacts, email as email_module, reminders
 from .auth import AuthenticationError
 
 # Initialize FastMCP server
@@ -524,6 +524,105 @@ async def email_mark_unread(
     """
     try:
         return await email_module.mark_as_unread(context, message_id, folder)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except Exception as e:
+        return {"error": str(e), "status": 500}
+
+
+# ============================================================================
+# Reminders Tools (CalDAV VTODO)
+# ============================================================================
+
+@mcp.tool()
+async def reminders_list_lists(context) -> list | dict:
+    """
+    List all reminder lists.
+
+    Returns a list of reminder lists with their IDs, names, and URLs.
+    """
+    try:
+        return await reminders.list_reminder_lists(context)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except Exception as e:
+        return {"error": str(e), "status": 500}
+
+
+@mcp.tool()
+async def reminders_list(
+    context,
+    list_id: str = None,
+    include_completed: bool = False
+) -> list | dict:
+    """
+    List reminders from a specific list or all reminder lists.
+
+    Args:
+        list_id: Reminder list URL/ID (optional, defaults to reminder-named lists)
+        include_completed: Include completed reminders (default: False)
+    """
+    try:
+        return await reminders.list_reminders(context, list_id, include_completed)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except Exception as e:
+        return {"error": str(e), "status": 500}
+
+
+@mcp.tool()
+async def reminders_create(
+    context,
+    summary: str,
+    list_id: str = None,
+    due: str = None,
+    description: str = None,
+    priority: int = None
+) -> dict:
+    """
+    Create a new reminder.
+
+    Args:
+        summary: Reminder title
+        list_id: Target reminder list URL/ID (optional)
+        due: Due date/time in ISO format, e.g. "2025-12-01T10:00:00" (optional)
+        description: Reminder notes (optional)
+        priority: Priority 1-9 where 1=highest, 5=medium, 9=lowest (optional)
+    """
+    try:
+        return await reminders.create_reminder(context, summary, list_id, due, description, priority)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except Exception as e:
+        return {"error": str(e), "status": 500}
+
+
+@mcp.tool()
+async def reminders_delete(context, reminder_id: str) -> dict:
+    """
+    Delete a reminder.
+
+    Args:
+        reminder_id: Reminder URL/ID to delete
+    """
+    try:
+        return await reminders.delete_reminder(context, reminder_id)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except Exception as e:
+        return {"error": str(e), "status": 500}
+
+
+@mcp.tool()
+async def reminders_complete(context, reminder_id: str) -> dict:
+    """
+    Mark a reminder as completed.
+
+    Args:
+        reminder_id: Reminder URL/ID to mark as complete
+    """
+    try:
+        return await reminders.complete_reminder(context, reminder_id)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except Exception as e:
