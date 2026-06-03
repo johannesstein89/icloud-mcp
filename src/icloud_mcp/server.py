@@ -1,16 +1,8 @@
 """FastMCP server for iCloud integration."""
 
-import logging
-import os
-
 from fastmcp import FastMCP
-from . import calendar, contacts, email as email_module, reminders
+from . import calendar, contacts, email as email_module
 from .auth import AuthenticationError
-
-# Enable DEBUG logging for the reminders module when LOG_LEVEL=DEBUG
-_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, _log_level, logging.INFO),
-                    format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 # Initialize FastMCP server
 mcp = FastMCP("iCloud MCP Server")
@@ -532,128 +524,6 @@ async def email_mark_unread(
     """
     try:
         return await email_module.mark_as_unread(context, message_id, folder)
-    except AuthenticationError as e:
-        return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
-
-
-# ============================================================================
-# Reminders Tools (CalDAV / VTODO)
-# ============================================================================
-
-@mcp.tool()
-async def reminders_list_lists(context) -> list | dict:
-    """
-    List all iCloud reminder lists.
-
-    Returns a list of reminder lists with their id (CalDAV URL) and name.
-    Uses the same app-specific password as calendar and contacts — no 2FA needed.
-    """
-    try:
-        return await reminders.list_reminder_lists(context)
-    except AuthenticationError as e:
-        return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
-
-
-@mcp.tool()
-async def reminders_create_list(context, name: str) -> dict:
-    """
-    Create a new iCloud reminder list.
-
-    Creates a CalDAV-native (non-upgraded) list that stays accessible over
-    CalDAV. Use this when your existing lists were upgraded to the CloudKit-only
-    format and no longer appear in reminders_list_lists. The new list will show
-    a ⚠️ in the Apple Reminders app — that's expected and means it's the legacy,
-    CalDAV-readable format.
-
-    Args:
-        name: Name for the new reminder list
-    """
-    try:
-        return await reminders.create_reminder_list(context, name)
-    except AuthenticationError as e:
-        return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
-
-
-@mcp.tool()
-async def reminders_list(
-    context,
-    list_id: str = None,
-    include_completed: bool = False
-) -> list | dict:
-    """
-    List reminders from all lists or a specific list.
-
-    Args:
-        list_id: Reminder list URL/ID from reminders_list_lists (optional, defaults to all lists)
-        include_completed: Include completed reminders (default: False)
-    """
-    try:
-        return await reminders.list_reminders(context, list_id, include_completed)
-    except AuthenticationError as e:
-        return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
-
-
-@mcp.tool()
-async def reminders_create(
-    context,
-    summary: str,
-    list_id: str = None,
-    due: str = None,
-    description: str = None,
-    priority: int = None
-) -> dict:
-    """
-    Create a new iCloud reminder.
-
-    Args:
-        summary: Reminder title
-        list_id: Target list URL/ID from reminders_list_lists (optional, uses first list)
-        due: Due date/time in ISO format, e.g. "2025-12-01T10:00:00" (optional)
-        description: Reminder notes (optional)
-        priority: Priority 0=none, 1=high, 5=medium, 9=low (optional)
-    """
-    try:
-        return await reminders.create_reminder(context, summary, list_id, due, description, priority)
-    except AuthenticationError as e:
-        return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
-
-
-@mcp.tool()
-async def reminders_delete(context, reminder_id: str) -> dict:
-    """
-    Delete an iCloud reminder.
-
-    Args:
-        reminder_id: Reminder URL (the 'id' field from reminders_list)
-    """
-    try:
-        return await reminders.delete_reminder(context, reminder_id)
-    except AuthenticationError as e:
-        return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
-
-
-@mcp.tool()
-async def reminders_complete(context, reminder_id: str) -> dict:
-    """
-    Mark an iCloud reminder as completed.
-
-    Args:
-        reminder_id: Reminder URL (the 'id' field from reminders_list)
-    """
-    try:
-        return await reminders.complete_reminder(context, reminder_id)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except Exception as e:
