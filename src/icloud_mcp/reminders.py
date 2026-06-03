@@ -23,9 +23,24 @@ def _supports_vtodo(cal) -> bool:
         props = cal.get_properties([
             "{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set"
         ])
-        return any("VTODO" in str(v) for v in props.values())
+        for value in props.values():
+            # value is an XML Element — iterate children for comp name="VTODO"
+            # (str(element) gives "<Element ... at 0x...>", NOT its content)
+            try:
+                for child in value:
+                    if child.get("name") == "VTODO":
+                        return True
+            except Exception:
+                pass
+            # Fallback: XML serialization
+            try:
+                from xml.etree.ElementTree import tostring
+                if b"VTODO" in tostring(value):
+                    return True
+            except Exception:
+                pass
+        return False
     except Exception:
-        # Can't determine — assume yes so we don't silently miss lists
         return True
 
 
@@ -128,10 +143,10 @@ async def list_reminders(
     if list_id:
         calendars_to_search = [caldav.Calendar(client=client, url=list_id)]
     else:
-        # Only query VTODO-capable collections
-        calendars_to_search = [
-            cal for cal in principal.calendars() if _supports_vtodo(cal)
-        ]
+        all_cals = principal.calendars()
+        vtodo_cals = [cal for cal in all_cals if _supports_vtodo(cal)]
+        # If _supports_vtodo filtered everything out (false negative), try all
+        calendars_to_search = vtodo_cals if vtodo_cals else all_cals
 
     result = []
     for cal in calendars_to_search:
