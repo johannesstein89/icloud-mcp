@@ -630,6 +630,23 @@ async def reminders_complete(context, reminder_id: str) -> dict:
 
 
 @mcp.tool()
+async def reminders_find_path(context) -> dict:
+    """
+    Targeted path discovery for iCloud Reminders.
+
+    Tests /reminders/ as a sibling to /calendars/, does a PROPFIND on
+    the user root, and tries other known iCloud path patterns.
+    Use this when reminders_list returns empty results.
+    """
+    try:
+        return await reminders.find_reminder_path(context)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except Exception as e:
+        return {"error": str(e), "status": 500}
+
+
+@mcp.tool()
 async def reminders_debug(context) -> dict:
     """
     Diagnostic tool for iCloud Reminders.

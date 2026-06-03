@@ -490,3 +490,179 @@ async def debug_reminders(context: Context) -> Dict[str, Any]:
 
     return result
 
+
+async def find_reminder_path(context: Context) -> Dict[str, Any]:
+    """
+    Targeted path discovery for iCloud Reminders.
+
+    Tests /reminders/ as a sibling to /calendars/ (the common iCloud
+    structure), does a PROPFIND on the user root, and tries other known
+    path patterns. Use this when reminders_debug returns empty lists.
+    """
+    import requests as _requests
+
+    email, password = require_auth(context)
+    auth = (email, password)
+    headers = {"Content-Type": "application/xml; charset=utf-8"}
+    result: Dict[str, Any] = {}
+
+    PROPFIND_BODY = b"""<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:displayname/>
+    <d:resourcetype/>
+    <c:supported-calendar-component-set/>
+  </d:prop>
+</d:propfind>"""
+
+    REPORT_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VTODO"/>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>"""
+
+    from xml.etree import ElementTree as ET
+    from urllib.parse import urlunparse
+
+    def _propfind(url, depth=1):
+        return _requests.request(
+            "PROPFIND", url,
+            headers={**headers, "Depth": str(depth)},
+            data=PROPFIND_BODY, auth=auth, allow_redirects=True, timeout=30
+        )
+
+    def _report(url):
+        return _requests.request(
+            "REPORT", url,
+            headers={**headers, "Depth": "1"},
+            data=REPORT_BODY, auth=auth, allow_redirects=True, timeout=30
+        )
+
+    def _parse_cols(xml_text, base_url):
+        p = urlparse(base_url)
+        cols = []
+        for resp in ET.fromstring(xml_text).findall("{DAV:}response"):
+            href = resp.findtext("{DAV:}href", "")
+            name = resp.findtext(".//{DAV:}displayname", "")
+            comp_set = resp.find(".//{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set")
+            components = [c.get("name") for c in comp_set] if comp_set is not None else []
+            is_cal = resp.find(".//{urn:ietf:params:xml:ns:caldav}calendar") is not None
+            abs_url = href if href.startswith("http") else urlunparse((p.scheme, p.netloc, href, "", "", ""))
+            cols.append({"name": name, "url": abs_url, "components": components, "is_calendar": is_cal})
+        return cols
+
+    def _parse_todos(xml_text):
+        todos = []
+        for resp in ET.fromstring(xml_text).findall("{DAV:}response"):
+            data = resp.findtext(".//{urn:ietf:params:xml:ns:caldav}calendar-data", "")
+            if not data:
+                continue
+            fields = {}
+            in_todo = False
+            for line in data.splitlines():
+                if line.strip() == "BEGIN:VTODO":
+                    in_todo = True
+                elif line.strip() == "END:VTODO":
+                    break
+                elif in_todo and ":" in line:
+                    k, _, v = line.partition(":")
+                    fields[k.split(";")[0]] = v
+            if fields:
+                todos.append({
+                    "summary": fields.get("SUMMARY", ""),
+                    "status": fields.get("STATUS", "NEEDS-ACTION"),
+                    "due": fields.get("DUE", ""),
+                    "priority": fields.get("PRIORITY", ""),
+                })
+        return todos
+
+    # ── Discover principal and calendar home ──────────────────────
+    r = _requests.request(
+        "PROPFIND", config.CALDAV_SERVER,
+        headers={**headers, "Depth": "0"},
+        data=b"""<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:current-user-principal/>
+    <c:calendar-home-set/>
+  </d:prop>
+</d:propfind>""",
+        auth=auth, allow_redirects=True, timeout=30
+    )
+    root = ET.fromstring(r.text)
+
+    principal_href = root.findtext(".//{DAV:}current-user-principal/{DAV:}href", "")
+    p0 = urlparse(r.url)
+    principal_url = principal_href if principal_href.startswith("http") else \
+        urlunparse((p0.scheme, p0.netloc, principal_href, "", "", ""))
+
+    # Get calendar-home-set from principal
+    r2 = _requests.request(
+        "PROPFIND", principal_url,
+        headers={**headers, "Depth": "0"},
+        data=b"""<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><c:calendar-home-set/></d:prop>
+</d:propfind>""",
+        auth=auth, allow_redirects=True, timeout=30
+    )
+    root2 = ET.fromstring(r2.text)
+    home_href = root2.findtext(".//{urn:ietf:params:xml:ns:caldav}calendar-home-set/{DAV:}href", "")
+    p1 = urlparse(r2.url)
+    cal_home = home_href if home_href.startswith("http") else \
+        urlunparse((p1.scheme, p1.netloc, home_href, "", "", ""))
+
+    result["principal"] = principal_url
+    result["calendar_home"] = cal_home
+
+    # Derive server base and user ID
+    p2 = urlparse(cal_home)
+    server = f"{p2.scheme}://{p2.netloc}"
+    user_id = p2.path.strip("/").split("/")[0]
+    user_root = f"{server}/{user_id}/"
+    result["server"] = server
+    result["user_id"] = user_id
+
+    # ── 1. PROPFIND on user root ──────────────────────────────────
+    r = _propfind(user_root, depth=1)
+    result["user_root_propfind"] = {"status": r.status_code, "collections": []}
+    if r.status_code in (200, 207):
+        cols = _parse_cols(r.text, user_root)
+        result["user_root_propfind"]["collections"] = cols
+
+    # ── 2. Try /reminders/ sibling ────────────────────────────────
+    reminders_home = f"{server}/{user_id}/reminders/"
+    r = _propfind(reminders_home, depth=1)
+    result["reminders_path"] = {"url": reminders_home, "status": r.status_code, "lists": []}
+
+    if r.status_code in (200, 207):
+        cols = _parse_cols(r.text, reminders_home)
+        for col in cols:
+            entry: Dict[str, Any] = {**col, "todos": [], "report_status": None}
+            if "VTODO" in col["components"]:
+                r2 = _report(col["url"])
+                entry["report_status"] = r2.status_code
+                if r2.status_code in (200, 207):
+                    entry["todos"] = _parse_todos(r2.text)
+            result["reminders_path"]["lists"].append(entry)
+
+    # ── 3. Try other candidate paths ─────────────────────────────
+    candidates = [
+        f"{server}/{user_id}/tasks/",
+        f"{server}/{user_id}/lists/",
+        f"{cal_home}reminders/",
+    ]
+    found_candidates = []
+    for url in candidates:
+        r = _propfind(url, depth=0)
+        if r.status_code in (200, 207):
+            found_candidates.append({"url": url, "status": r.status_code})
+    result["other_candidates"] = found_candidates
+
+    return result
+
+
