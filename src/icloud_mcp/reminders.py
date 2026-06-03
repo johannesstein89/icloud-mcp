@@ -116,12 +116,7 @@ async def list_reminders(
     if list_id:
         calendars_to_search = [caldav.Calendar(client=client, url=list_id)]
     else:
-        all_calendars = principal.calendars()
-        reminder_cals = [
-            cal for cal in all_calendars
-            if cal.name and ('reminder' in cal.name.lower() or '⚠' in cal.name)
-        ]
-        calendars_to_search = reminder_cals if reminder_cals else all_calendars
+        calendars_to_search = principal.calendars()
 
     result = []
     for cal in calendars_to_search:
@@ -166,13 +161,16 @@ async def create_reminder(
         calendar = caldav.Calendar(client=client, url=list_id)
     else:
         all_calendars = principal.calendars()
-        reminder_cals = [
-            cal for cal in all_calendars
-            if cal.name and ('reminder' in cal.name.lower() or '⚠' in cal.name)
-        ]
-        if not reminder_cals:
+        calendar = None
+        for cal in all_calendars:
+            try:
+                cal.todos()
+                calendar = cal
+                break
+            except Exception:
+                continue
+        if calendar is None:
             raise ValueError("No reminder list found. Please specify a list_id.")
-        calendar = reminder_cals[0]
 
     now = datetime.now()
     uid = f"{int(now.timestamp())}{now.microsecond}@icloud-mcp"
