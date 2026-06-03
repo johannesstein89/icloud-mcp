@@ -1,8 +1,16 @@
 """FastMCP server for iCloud integration."""
 
+import logging
+import os
+
 from fastmcp import FastMCP
 from . import calendar, contacts, email as email_module, reminders
 from .auth import AuthenticationError
+
+# Enable DEBUG logging for the reminders module when LOG_LEVEL=DEBUG
+_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, _log_level, logging.INFO),
+                    format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 # Initialize FastMCP server
 mcp = FastMCP("iCloud MCP Server")
