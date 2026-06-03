@@ -17,12 +17,23 @@ def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
     )
 
 
-def _parse_todo(todo, calendar_name: str = "") -> Optional[Dict[str, Any]]:
+def _parse_todo(todo, email: str, password: str, calendar_name: str = "") -> Optional[Dict[str, Any]]:
     try:
-        todo.load()
+        # Data is usually included in the REPORT response — no load() needed
         vtodo = todo.vobject_instance.vtodo
     except Exception:
-        return None
+        # Fallback: iCloud uses numbered sub-servers (p72-caldav.icloud.com)
+        # that differ from the discovery host, so we need a URL-specific client
+        try:
+            todo_url = str(todo.url)
+            parsed_url = urlparse(todo_url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            sub_client = caldav.DAVClient(url=base_url, username=email, password=password)
+            todo = caldav.CalendarObjectResource(client=sub_client, url=todo_url)
+            todo.load()
+            vtodo = todo.vobject_instance.vtodo
+        except Exception:
+            return None
 
     due = None
     if hasattr(vtodo, 'due') and vtodo.due:
@@ -60,6 +71,15 @@ def _parse_todo(todo, calendar_name: str = "") -> Optional[Dict[str, Any]]:
     }
 
 
+def _supports_vtodo(calendar: caldav.Calendar) -> bool:
+    """Return True if this calendar supports VTODO (i.e. it's a Reminders list)."""
+    try:
+        components = calendar.get_supported_components()
+        return "VTODO" in components
+    except Exception:
+        return False
+
+
 async def list_reminder_lists(context: Context) -> List[Dict[str, Any]]:
     """
     List all reminder lists (CalDAV calendars that support VTODO).
@@ -70,17 +90,12 @@ async def list_reminder_lists(context: Context) -> List[Dict[str, Any]]:
     email, password = require_auth(context)
     client = _get_caldav_client(email, password)
     principal = client.principal()
-    calendars = principal.calendars()
 
-    result = []
-    for cal in calendars:
-        result.append({
-            "id": str(cal.url),
-            "name": cal.name or "Unnamed List",
-            "url": str(cal.url)
-        })
-
-    return result
+    return [
+        {"id": str(cal.url), "name": cal.name or "Unnamed List", "url": str(cal.url)}
+        for cal in principal.calendars()
+        if _supports_vtodo(cal)
+    ]
 
 
 async def list_reminders(
@@ -105,7 +120,7 @@ async def list_reminders(
     if list_id:
         calendars_to_search = [caldav.Calendar(client=client, url=list_id)]
     else:
-        calendars_to_search = principal.calendars()
+        calendars_to_search = [cal for cal in principal.calendars() if _supports_vtodo(cal)]
 
     result = []
     for cal in calendars_to_search:
@@ -115,7 +130,7 @@ async def list_reminders(
             except TypeError:
                 todos = cal.todos()
             for todo in todos:
-                parsed = _parse_todo(todo, cal.name or "")
+                parsed = _parse_todo(todo, email, password, cal.name or "")
                 if parsed:
                     result.append(parsed)
         except Exception:
