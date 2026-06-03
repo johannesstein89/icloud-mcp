@@ -531,15 +531,16 @@ async def email_mark_unread(
 
 
 # ============================================================================
-# Reminders Tools (CalDAV VTODO)
+# Reminders Tools (pyicloud / CloudKit backend)
 # ============================================================================
 
 @mcp.tool()
 async def reminders_list_lists(context) -> list | dict:
     """
-    List all reminder lists.
+    List all iCloud reminder lists.
 
-    Returns a list of reminder lists with their IDs, names, and URLs.
+    Returns a list of reminder lists with their id and name.
+    If the account requires 2FA, call reminders_verify_2fa first.
     """
     try:
         return await reminders.list_reminder_lists(context)
@@ -556,11 +557,13 @@ async def reminders_list(
     include_completed: bool = False
 ) -> list | dict:
     """
-    List reminders from a specific list or all reminder lists.
+    List reminders from all lists or a specific list.
 
     Args:
-        list_id: Reminder list URL/ID (optional, defaults to reminder-named lists)
+        list_id: Reminder list name or GUID (optional, defaults to all lists)
         include_completed: Include completed reminders (default: False)
+
+    Note: Requires ICLOUD_PASSWORD env var (Apple ID password, not app-specific).
     """
     try:
         return await reminders.list_reminders(context, list_id, include_completed)
@@ -580,14 +583,14 @@ async def reminders_create(
     priority: int = None
 ) -> dict:
     """
-    Create a new reminder.
+    Create a new iCloud reminder.
 
     Args:
         summary: Reminder title
-        list_id: Target reminder list URL/ID (optional)
+        list_id: Target list name or GUID (optional, uses default list)
         due: Due date/time in ISO format, e.g. "2025-12-01T10:00:00" (optional)
         description: Reminder notes (optional)
-        priority: Priority 1-9 where 1=highest, 5=medium, 9=lowest (optional)
+        priority: Priority 0=none, 1=high, 5=medium, 9=low (optional)
     """
     try:
         return await reminders.create_reminder(context, summary, list_id, due, description, priority)
@@ -600,10 +603,10 @@ async def reminders_create(
 @mcp.tool()
 async def reminders_delete(context, reminder_id: str) -> dict:
     """
-    Delete a reminder.
+    Delete an iCloud reminder.
 
     Args:
-        reminder_id: Reminder URL/ID to delete
+        reminder_id: Reminder GUID (from reminders_list)
     """
     try:
         return await reminders.delete_reminder(context, reminder_id)
@@ -616,10 +619,10 @@ async def reminders_delete(context, reminder_id: str) -> dict:
 @mcp.tool()
 async def reminders_complete(context, reminder_id: str) -> dict:
     """
-    Mark a reminder as completed.
+    Mark an iCloud reminder as completed.
 
     Args:
-        reminder_id: Reminder URL/ID to mark as complete
+        reminder_id: Reminder GUID (from reminders_list)
     """
     try:
         return await reminders.complete_reminder(context, reminder_id)
@@ -630,34 +633,18 @@ async def reminders_complete(context, reminder_id: str) -> dict:
 
 
 @mcp.tool()
-async def reminders_find_path(context) -> dict:
+async def reminders_verify_2fa(context, code: str) -> dict:
     """
-    Targeted path discovery for iCloud Reminders.
+    Complete iCloud two-factor authentication for the Reminders service.
 
-    Tests /reminders/ as a sibling to /calendars/, does a PROPFIND on
-    the user root, and tries other known iCloud path patterns.
-    Use this when reminders_list returns empty results.
-    """
-    try:
-        return await reminders.find_reminder_path(context)
-    except AuthenticationError as e:
-        return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    Call any reminders tool first — if 2FA is needed, a code is automatically
+    sent to your trusted Apple device. Then call this tool with that code.
 
-
-@mcp.tool()
-async def reminders_debug(context) -> dict:
-    """
-    Diagnostic tool for iCloud Reminders.
-
-    Performs raw CalDAV discovery and VTODO REPORT requests, bypassing
-    the caldav library abstraction. Returns detailed information about
-    all collections, their supported component types, and the actual
-    VTODOs found per list — useful for diagnosing sync issues.
+    Args:
+        code: 6-digit 2FA code from your Apple device
     """
     try:
-        return await reminders.debug_reminders(context)
+        return await reminders.verify_2fa(context, code)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except Exception as e:

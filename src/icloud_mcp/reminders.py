@@ -1,124 +1,103 @@
-"""CalDAV tools for iCloud Reminders management."""
+"""iCloud Reminders management via pyicloud (CloudKit backend)."""
 
-import caldav
+import os
+import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse
 from fastmcp import Context
 from .auth import require_auth
-from .config import config
+
+logger = logging.getLogger(__name__)
+
+COOKIE_DIR = os.environ.get("PYICLOUD_COOKIE_DIR", "/tmp/pyicloud_cookies")
+
+# Module-level cache so the same authenticated API instance is reused
+# within the process lifetime (important for the 2FA verification flow).
+_api_cache: Dict[str, Any] = {}
 
 
-def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
-    return caldav.DAVClient(
-        url=config.CALDAV_SERVER,
-        username=email,
-        password=password
-    )
+def _apple_password(fallback: str) -> str:
+    """Return the Apple ID password for pyicloud.
+
+    pyicloud requires the real Apple ID password, not an app-specific one.
+    Set ICLOUD_PASSWORD to override; otherwise the provided credential is used.
+    """
+    return os.environ.get("ICLOUD_PASSWORD") or fallback
 
 
-def _supports_vtodo(cal) -> bool:
-    """Return True if the calendar collection supports VTODO components."""
-    try:
-        props = cal.get_properties([
-            "{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set"
-        ])
-        for value in props.values():
-            # value is an XML Element — iterate children for comp name="VTODO"
-            # (str(element) gives "<Element ... at 0x...>", NOT its content)
-            try:
-                for child in value:
-                    if child.get("name") == "VTODO":
-                        return True
-            except Exception:
-                pass
-            # Fallback: XML serialization
-            try:
-                from xml.etree.ElementTree import tostring
-                if b"VTODO" in tostring(value):
-                    return True
-            except Exception:
-                pass
-        return False
-    except Exception:
-        return True
+def _get_api(email: str, password: str):
+    """Return an authenticated PyiCloudService, raising ValueError if 2FA is needed."""
+    from pyicloud import PyiCloudService
+
+    os.makedirs(COOKIE_DIR, exist_ok=True)
+    apple_pw = _apple_password(password)
+
+    cached = _api_cache.get(email)
+    if cached is not None and not cached.requires_2fa and not cached.requires_2sa:
+        return cached
+
+    api = PyiCloudService(email, apple_pw, cookie_directory=COOKIE_DIR)
+    _api_cache[email] = api
+
+    if api.requires_2fa:
+        raise ValueError(
+            "2FA_REQUIRED: iCloud requires two-factor authentication. "
+            "A 6-digit code was sent to your trusted Apple device. "
+            "Call reminders_verify_2fa with that code."
+        )
+    if api.requires_2sa:
+        raise ValueError(
+            "2SA_REQUIRED: iCloud requires two-step verification. "
+            "A code was sent to your trusted device or phone. "
+            "Call reminders_verify_2fa with that code."
+        )
+
+    return api
 
 
-def _parse_todo(todo, email: str, password: str, calendar_name: str = "") -> Optional[Dict[str, Any]]:
-    try:
-        # Data is usually included in the REPORT response
-        vtodo = todo.vobject_instance.vtodo
-    except Exception:
-        # Fallback: iCloud serves todos from numbered sub-servers
-        # (e.g. p72-caldav.icloud.com), load with URL-specific client
-        try:
-            todo_url = str(todo.url)
-            parsed_url = urlparse(todo_url)
-            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-            sub_client = caldav.DAVClient(url=base_url, username=email, password=password)
-            todo = caldav.CalendarObjectResource(client=sub_client, url=todo_url)
-            todo.load()
-            vtodo = todo.vobject_instance.vtodo
-        except Exception:
-            return None
-
+def _format_reminder(reminder: dict, list_name: str = "") -> Dict[str, Any]:
     due = None
-    if hasattr(vtodo, "due") and vtodo.due:
+    due_date = reminder.get("dueDate")
+    if reminder.get("hasDueDate") and due_date and isinstance(due_date, list):
         try:
-            val = vtodo.due.value
-            due = val.isoformat() if hasattr(val, "isoformat") else str(val)
+            year, month, day = due_date[0], due_date[1], due_date[2]
+            hour = due_date[3] if len(due_date) > 3 else 0
+            minute = due_date[4] if len(due_date) > 4 else 0
+            due = datetime(year, month, day, hour, minute).isoformat()
         except Exception:
             pass
 
     completed_at = None
-    if hasattr(vtodo, "completed") and vtodo.completed:
+    completed_date = reminder.get("completedDate")
+    if reminder.get("completed") and completed_date and isinstance(completed_date, list):
         try:
-            val = vtodo.completed.value
-            completed_at = val.isoformat() if hasattr(val, "isoformat") else str(val)
-        except Exception:
-            pass
-
-    priority = None
-    if hasattr(vtodo, "priority") and vtodo.priority:
-        try:
-            priority = int(vtodo.priority.value)
+            completed_at = datetime(
+                completed_date[0], completed_date[1], completed_date[2]
+            ).isoformat()
         except Exception:
             pass
 
     return {
-        "id": str(todo.url),
-        "summary": str(vtodo.summary.value) if hasattr(vtodo, "summary") and vtodo.summary else "",
-        "description": str(vtodo.description.value) if hasattr(vtodo, "description") and vtodo.description else "",
-        "status": str(vtodo.status.value) if hasattr(vtodo, "status") and vtodo.status else "NEEDS-ACTION",
+        "id": reminder.get("guid", ""),
+        "summary": reminder.get("title", ""),
+        "description": reminder.get("description", ""),
+        "status": "COMPLETED" if reminder.get("completed") else "NEEDS-ACTION",
         "due": due,
         "completed_at": completed_at,
-        "priority": priority,
-        "list": calendar_name,
-        "url": str(todo.url),
+        "priority": reminder.get("priority"),
+        "list": list_name,
     }
 
 
 async def list_reminder_lists(context: Context) -> List[Dict[str, Any]]:
-    """
-    List all reminder lists (CalDAV collections that support VTODO).
-
-    Returns:
-        List of reminder lists with id, name, and URL
-    """
+    """List all iCloud reminder lists (collections)."""
     email, password = require_auth(context)
-    client = _get_caldav_client(email, password)
-    principal = client.principal()
+    api = _get_api(email, password)
 
-    result = []
-    for cal in principal.calendars():
-        if _supports_vtodo(cal):
-            result.append({
-                "id": str(cal.url),
-                "name": cal.name or "Unnamed List",
-                "url": str(cal.url),
-            })
-
-    return result
+    return [
+        {"id": col.get("guid", name), "name": name}
+        for name, col in api.reminders.collections.items()
+    ]
 
 
 async def list_reminders(
@@ -126,43 +105,26 @@ async def list_reminders(
     list_id: Optional[str] = None,
     include_completed: bool = False,
 ) -> List[Dict[str, Any]]:
-    """
-    List reminders from a specific list or all reminder lists.
-
-    Args:
-        list_id: Reminder list URL/ID (optional)
-        include_completed: Include completed reminders (default: False)
-
-    Returns:
-        List of reminders with details
-    """
+    """List reminders, optionally filtered to a specific list."""
     email, password = require_auth(context)
-    client = _get_caldav_client(email, password)
-    principal = client.principal()
+    api = _get_api(email, password)
 
     if list_id:
-        calendars_to_search = [caldav.Calendar(client=client, url=list_id)]
+        target_names = [
+            name for name, col in api.reminders.collections.items()
+            if name == list_id or col.get("guid") == list_id
+        ]
+        if not target_names:
+            raise ValueError(f"Reminder list '{list_id}' not found.")
     else:
-        all_cals = principal.calendars()
-        vtodo_cals = [cal for cal in all_cals if _supports_vtodo(cal)]
-        # If _supports_vtodo filtered everything out (false negative), try all
-        calendars_to_search = vtodo_cals if vtodo_cals else all_cals
+        target_names = list(api.reminders.collections.keys())
 
     result = []
-    for cal in calendars_to_search:
-        try:
-            # Fetch ALL todos without a server-side COMPLETED filter — iCloud
-            # does not reliably support that filter. Filter client-side instead.
-            todos = cal.todos(include_completed=True)
-            for todo in todos:
-                parsed = _parse_todo(todo, email, password, cal.name or "")
-                if parsed is None:
-                    continue
-                if not include_completed and parsed.get("status") == "COMPLETED":
-                    continue
-                result.append(parsed)
-        except Exception:
-            continue
+    for name in target_names:
+        for reminder in api.reminders.get(name):
+            if not include_completed and reminder.get("completed"):
+                continue
+            result.append(_format_reminder(reminder, name))
 
     return result
 
@@ -175,494 +137,127 @@ async def create_reminder(
     description: Optional[str] = None,
     priority: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Create a new reminder (VTODO).
-
-    Args:
-        summary: Reminder title
-        list_id: Target reminder list URL/ID (optional)
-        due: Due date/time in ISO format, e.g. "2025-12-01T10:00:00" (optional)
-        description: Reminder notes (optional)
-        priority: Priority 1-9 (1=highest, 5=medium, 9=lowest) (optional)
-
-    Returns:
-        Created reminder details
-    """
+    """Create a new iCloud reminder."""
     email, password = require_auth(context)
-    client = _get_caldav_client(email, password)
-    principal = client.principal()
+    api = _get_api(email, password)
 
+    collection_name = None
     if list_id:
-        calendar = caldav.Calendar(client=client, url=list_id)
-    else:
-        calendar = next(
-            (cal for cal in principal.calendars() if _supports_vtodo(cal)),
-            None,
-        )
-        if calendar is None:
-            raise ValueError("No reminder list found. Please specify a list_id.")
+        for name, col in api.reminders.collections.items():
+            if name == list_id or col.get("guid") == list_id:
+                collection_name = name
+                break
+        if collection_name is None:
+            raise ValueError(f"Reminder list '{list_id}' not found.")
 
-    now = datetime.now()
-    uid = f"{int(now.timestamp())}{now.microsecond}@icloud-mcp"
+    due_date = datetime.fromisoformat(due) if due else None
 
-    ical_lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//iCloud MCP//EN",
-        "CALSCALE:GREGORIAN",
-        "BEGIN:VTODO",
-        f"UID:{uid}",
-        f"DTSTAMP:{now.strftime('%Y%m%dT%H%M%SZ')}",
-        f"CREATED:{now.strftime('%Y%m%dT%H%M%SZ')}",
-        f"LAST-MODIFIED:{now.strftime('%Y%m%dT%H%M%SZ')}",
-        f"SUMMARY:{summary}",
-        "STATUS:NEEDS-ACTION",
-        "SEQUENCE:0",
-    ]
+    api.reminders.post(
+        subject=summary,
+        description=description or "",
+        collection=collection_name,
+        due_date=due_date,
+    )
 
-    if due:
-        due_dt = datetime.fromisoformat(due)
-        ical_lines.append(f"DUE:{due_dt.strftime('%Y%m%dT%H%M%S')}")
-
-    if description:
-        desc_escaped = (
-            description
-            .replace("\\", "\\\\")
-            .replace(",", "\\,")
-            .replace(";", "\\;")
-            .replace("\n", "\\n")
-        )
-        ical_lines.append(f"DESCRIPTION:{desc_escaped}")
-
-    if priority is not None:
-        ical_lines.append(f"PRIORITY:{priority}")
-
-    ical_lines += ["END:VTODO", "END:VCALENDAR"]
-    ical_data = "\r\n".join(ical_lines)
-
-    try:
-        todo = calendar.add_todo(ical_data)
-    except Exception as e:
-        raise ValueError(f"Failed to create reminder in list '{calendar.name}': {str(e)}")
-
+    default_list = collection_name or (
+        next(iter(api.reminders.collections), "") if api.reminders.collections else ""
+    )
     return {
-        "id": str(todo.url),
         "summary": summary,
+        "description": description or "",
         "status": "NEEDS-ACTION",
         "due": due or "",
-        "description": description or "",
-        "priority": priority,
-        "list": calendar.name,
-        "url": str(todo.url),
+        "list": default_list,
     }
 
 
+def _find_reminder(api, reminder_id: str):
+    """Return (reminder_dict, list_name) or raise ValueError."""
+    for name in api.reminders.collections:
+        for r in api.reminders.get(name):
+            if r.get("guid") == reminder_id:
+                return dict(r), name
+    raise ValueError(f"Reminder '{reminder_id}' not found.")
+
+
 async def delete_reminder(context: Context, reminder_id: str) -> Dict[str, str]:
-    """
-    Delete a reminder.
-
-    Args:
-        reminder_id: Reminder URL/ID to delete
-
-    Returns:
-        Confirmation message
-    """
+    """Delete an iCloud reminder by GUID."""
     email, password = require_auth(context)
+    api = _get_api(email, password)
 
-    parsed = urlparse(reminder_id)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-    client = caldav.DAVClient(url=base_url, username=email, password=password)
+    reminder, _ = _find_reminder(api, reminder_id)
 
-    todo = caldav.CalendarObjectResource(client=client, url=reminder_id)
-    todo.delete()
+    params = dict(api.reminders._params)
+    params.update({"clientVersion": "4.0", "lang": "en-us"})
 
-    return {"status": "success", "message": f"Reminder {reminder_id} deleted"}
+    resp = api.reminders._session.delete(
+        api.reminders._service_root + "/rd/reminder",
+        params=params,
+        json={"Reminders": {"guid": reminder_id, "pGuid": reminder.get("pGuid", "")}},
+    )
+
+    if resp.status_code not in (200, 204):
+        raise ValueError(f"Delete failed: HTTP {resp.status_code} — {resp.text[:200]}")
+
+    return {"status": "success", "message": "Reminder deleted."}
 
 
 async def complete_reminder(context: Context, reminder_id: str) -> Dict[str, Any]:
-    """
-    Mark a reminder as completed.
-
-    Args:
-        reminder_id: Reminder URL/ID to mark as complete
-
-    Returns:
-        Updated reminder details
-    """
+    """Mark an iCloud reminder as completed."""
     email, password = require_auth(context)
+    api = _get_api(email, password)
 
-    parsed = urlparse(reminder_id)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-    client = caldav.DAVClient(url=base_url, username=email, password=password)
+    reminder, list_name = _find_reminder(api, reminder_id)
 
-    todo = caldav.CalendarObjectResource(client=client, url=reminder_id)
-    todo.load()
-
-    vtodo = todo.vobject_instance.vtodo
     now = datetime.now()
+    reminder["completed"] = True
+    reminder["completedDate"] = [now.year, now.month, now.day, now.hour, now.minute]
 
-    if hasattr(vtodo, "status"):
-        vtodo.status.value = "COMPLETED"
-    else:
-        vtodo.add("status").value = "COMPLETED"
+    params = dict(api.reminders._params)
+    params.update({"clientVersion": "4.0", "lang": "en-us"})
 
-    if hasattr(vtodo, "completed"):
-        vtodo.completed.value = now
-    else:
-        vtodo.add("completed").value = now
+    resp = api.reminders._session.post(
+        api.reminders._service_root + "/rd/reminders",
+        params=params,
+        json={"Reminders": [reminder]},
+    )
 
-    updated_ical = todo.vobject_instance.serialize()
-    client.put(reminder_id, updated_ical, {"Content-Type": "text/calendar; charset=utf-8"})
+    if resp.status_code not in (200, 204):
+        raise ValueError(f"Complete failed: HTTP {resp.status_code} — {resp.text[:200]}")
 
     return {
         "id": reminder_id,
         "status": "COMPLETED",
         "completed_at": now.isoformat(),
-        "url": reminder_id,
+        "list": list_name,
     }
 
 
-async def debug_reminders(context: Context) -> Dict[str, Any]:
-    """
-    Diagnostic tool: raw CalDAV discovery and VTODO fetch test.
-
-    Returns detailed information about all CalDAV collections, their
-    supported component types, and the raw REPORT results per list.
-    Useful for diagnosing why reminders are not visible.
-    """
-    import requests as _requests
-    from xml.etree import ElementTree as ET
-
+async def verify_2fa(context: Context, code: str) -> Dict[str, str]:
+    """Submit a 2FA/2SA code to complete iCloud authentication."""
     email, password = require_auth(context)
-    auth = (email, password)
-    result: Dict[str, Any] = {"steps": {}}
+    from pyicloud import PyiCloudService
 
-    def _propfind(url, depth, body):
-        return _requests.request(
-            "PROPFIND", url,
-            headers={"Content-Type": "application/xml; charset=utf-8",
-                     "Depth": str(depth)},
-            data=body, auth=auth, allow_redirects=True, timeout=30
-        )
+    os.makedirs(COOKIE_DIR, exist_ok=True)
+    apple_pw = _apple_password(password)
 
-    # ── 1. Principal ──────────────────────────────────────────────
-    r = _propfind(config.CALDAV_SERVER, 0, b"""<?xml version="1.0"?>
-<d:propfind xmlns:d="DAV:">
-  <d:prop><d:current-user-principal/></d:prop>
-</d:propfind>""")
-    root = ET.fromstring(r.text)
-    href = root.find(".//{DAV:}current-user-principal/{DAV:}href")
-    if href is None:
-        return {"error": "Cannot find principal", "raw": r.text[:500]}
+    # Reuse cached instance so we verify against the same auth challenge.
+    api = _api_cache.get(email)
+    if api is None:
+        api = PyiCloudService(email, apple_pw, cookie_directory=COOKIE_DIR)
+        _api_cache[email] = api
 
-    p = urlparse(r.url)
-    principal_path = href.text
-    if principal_path.startswith("http"):
-        principal_url = principal_path
-    else:
-        from urllib.parse import urlunparse
-        principal_url = urlunparse((p.scheme, p.netloc, principal_path, "", "", ""))
-    result["steps"]["principal"] = principal_url
+    if not api.requires_2fa and not api.requires_2sa:
+        return {"status": "ok", "message": "Already authenticated — no 2FA needed."}
 
-    # ── 2. Calendar home set ──────────────────────────────────────
-    r = _propfind(principal_url, 0, b"""<?xml version="1.0"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop><c:calendar-home-set/></d:prop>
-</d:propfind>""")
-    root = ET.fromstring(r.text)
-    href = root.find(".//{urn:ietf:params:xml:ns:caldav}calendar-home-set/{DAV:}href")
-    if href is None:
-        return {"error": "Cannot find calendar-home-set", "raw": r.text[:500]}
+    if api.requires_2fa:
+        if not api.validate_2fa_code(code):
+            raise ValueError("2FA code invalid or expired. Try again.")
+        api.trust_session()
+        return {"status": "success", "message": "2FA verified. Session trusted."}
 
-    home_path = href.text
-    p2 = urlparse(r.url)
-    if home_path.startswith("http"):
-        home_url = home_path
-    else:
-        from urllib.parse import urlunparse
-        home_url = urlunparse((p2.scheme, p2.netloc, home_path, "", "", ""))
-    result["steps"]["calendar_home"] = home_url
-
-    # ── 3. List all collections ───────────────────────────────────
-    r = _propfind(home_url, 1, b"""<?xml version="1.0"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop>
-    <d:displayname/>
-    <d:resourcetype/>
-    <c:supported-calendar-component-set/>
-  </d:prop>
-</d:propfind>""")
-    root = ET.fromstring(r.text)
-    collections = []
-    for resp in root.findall("{DAV:}response"):
-        href_el = resp.find("{DAV:}href")
-        col_url = href_el.text if href_el is not None else ""
-        name_el = resp.find(".//{DAV:}displayname")
-        name = name_el.text if name_el is not None else ""
-        comp_set = resp.find(".//{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set")
-        components = [c.get("name") for c in comp_set] if comp_set is not None else []
-        is_cal = resp.find(".//{urn:ietf:params:xml:ns:caldav}calendar") is not None
-        collections.append({
-            "name": name, "url": col_url,
-            "components": components, "is_calendar": is_cal
-        })
-    result["steps"]["collections"] = collections
-
-    # ── 4. Fetch VTODOs from each VTODO-capable collection ───────
-    from urllib.parse import urlunparse as _uu
-    p3 = urlparse(home_url)
-    base = f"{p3.scheme}://{p3.netloc}"
-
-    vtodo_cols = [c for c in collections if "VTODO" in c["components"]]
-    if not vtodo_cols:
-        vtodo_cols = [c for c in collections if c["is_calendar"]]
-
-    report_body = b"""<?xml version="1.0" encoding="utf-8"?>
-<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop><d:getetag/><c:calendar-data/></d:prop>
-  <c:filter>
-    <c:comp-filter name="VCALENDAR">
-      <c:comp-filter name="VTODO"/>
-    </c:comp-filter>
-  </c:filter>
-</c:calendar-query>"""
-
-    todos_by_list = []
-    for col in vtodo_cols:
-        col_url = col["url"]
-        if not col_url.startswith("http"):
-            col_url = base + col_url
-
-        r = _requests.request(
-            "REPORT", col_url,
-            headers={"Content-Type": "application/xml; charset=utf-8", "Depth": "1"},
-            data=report_body, auth=auth, allow_redirects=True, timeout=30
-        )
-        todos = []
-        if r.status_code in (200, 207):
-            try:
-                rroot = ET.fromstring(r.text)
-                for rresp in rroot.findall("{DAV:}response"):
-                    cal_data = rresp.find(
-                        ".//{urn:ietf:params:xml:ns:caldav}calendar-data")
-                    if cal_data is not None and cal_data.text:
-                        fields = {}
-                        in_todo = False
-                        for line in cal_data.text.splitlines():
-                            if line.strip() == "BEGIN:VTODO":
-                                in_todo = True
-                            elif line.strip() == "END:VTODO":
-                                break
-                            elif in_todo and ":" in line:
-                                k, _, v = line.partition(":")
-                                fields[k.split(";")[0]] = v
-                        todos.append({
-                            "summary": fields.get("SUMMARY", ""),
-                            "status": fields.get("STATUS", "NEEDS-ACTION"),
-                            "due": fields.get("DUE", ""),
-                            "priority": fields.get("PRIORITY", ""),
-                            "description": fields.get("DESCRIPTION", ""),
-                            "uid": fields.get("UID", ""),
-                        })
-            except Exception as e:
-                todos_by_list.append({
-                    "list": col["name"], "url": col_url,
-                    "report_status": r.status_code,
-                    "error": str(e), "todos": []
-                })
-                continue
-        todos_by_list.append({
-            "list": col["name"], "url": col_url,
-            "report_status": r.status_code,
-            "todos_count": len(todos),
-            "todos": todos
-        })
-
-    result["steps"]["todos_by_list"] = todos_by_list
-    result["total_todos"] = sum(x.get("todos_count", 0) for x in todos_by_list)
-
-    if result["total_todos"] == 0:
-        result["diagnosis"] = (
-            "No reminders found via CalDAV. Most likely cause: "
-            "Reminders are not synced to iCloud. "
-            "Check: iPhone → Settings → [Name] → iCloud → Reminders → ON"
-        )
-
-    return result
-
-
-async def find_reminder_path(context: Context) -> Dict[str, Any]:
-    """
-    Targeted path discovery for iCloud Reminders.
-
-    Tests /reminders/ as a sibling to /calendars/ (the common iCloud
-    structure), does a PROPFIND on the user root, and tries other known
-    path patterns. Use this when reminders_debug returns empty lists.
-    """
-    import requests as _requests
-
-    email, password = require_auth(context)
-    auth = (email, password)
-    headers = {"Content-Type": "application/xml; charset=utf-8"}
-    result: Dict[str, Any] = {}
-
-    PROPFIND_BODY = b"""<?xml version="1.0"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop>
-    <d:displayname/>
-    <d:resourcetype/>
-    <c:supported-calendar-component-set/>
-  </d:prop>
-</d:propfind>"""
-
-    REPORT_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
-<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop><d:getetag/><c:calendar-data/></d:prop>
-  <c:filter>
-    <c:comp-filter name="VCALENDAR">
-      <c:comp-filter name="VTODO"/>
-    </c:comp-filter>
-  </c:filter>
-</c:calendar-query>"""
-
-    from xml.etree import ElementTree as ET
-    from urllib.parse import urlunparse
-
-    def _propfind(url, depth=1):
-        return _requests.request(
-            "PROPFIND", url,
-            headers={**headers, "Depth": str(depth)},
-            data=PROPFIND_BODY, auth=auth, allow_redirects=True, timeout=30
-        )
-
-    def _report(url):
-        return _requests.request(
-            "REPORT", url,
-            headers={**headers, "Depth": "1"},
-            data=REPORT_BODY, auth=auth, allow_redirects=True, timeout=30
-        )
-
-    def _parse_cols(xml_text, base_url):
-        p = urlparse(base_url)
-        cols = []
-        for resp in ET.fromstring(xml_text).findall("{DAV:}response"):
-            href = resp.findtext("{DAV:}href", "")
-            name = resp.findtext(".//{DAV:}displayname", "")
-            comp_set = resp.find(".//{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set")
-            components = [c.get("name") for c in comp_set] if comp_set is not None else []
-            is_cal = resp.find(".//{urn:ietf:params:xml:ns:caldav}calendar") is not None
-            abs_url = href if href.startswith("http") else urlunparse((p.scheme, p.netloc, href, "", "", ""))
-            cols.append({"name": name, "url": abs_url, "components": components, "is_calendar": is_cal})
-        return cols
-
-    def _parse_todos(xml_text):
-        todos = []
-        for resp in ET.fromstring(xml_text).findall("{DAV:}response"):
-            data = resp.findtext(".//{urn:ietf:params:xml:ns:caldav}calendar-data", "")
-            if not data:
-                continue
-            fields = {}
-            in_todo = False
-            for line in data.splitlines():
-                if line.strip() == "BEGIN:VTODO":
-                    in_todo = True
-                elif line.strip() == "END:VTODO":
-                    break
-                elif in_todo and ":" in line:
-                    k, _, v = line.partition(":")
-                    fields[k.split(";")[0]] = v
-            if fields:
-                todos.append({
-                    "summary": fields.get("SUMMARY", ""),
-                    "status": fields.get("STATUS", "NEEDS-ACTION"),
-                    "due": fields.get("DUE", ""),
-                    "priority": fields.get("PRIORITY", ""),
-                })
-        return todos
-
-    # ── Discover principal and calendar home ──────────────────────
-    r = _requests.request(
-        "PROPFIND", config.CALDAV_SERVER,
-        headers={**headers, "Depth": "0"},
-        data=b"""<?xml version="1.0"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop>
-    <d:current-user-principal/>
-    <c:calendar-home-set/>
-  </d:prop>
-</d:propfind>""",
-        auth=auth, allow_redirects=True, timeout=30
-    )
-    root = ET.fromstring(r.text)
-
-    principal_href = root.findtext(".//{DAV:}current-user-principal/{DAV:}href", "")
-    p0 = urlparse(r.url)
-    principal_url = principal_href if principal_href.startswith("http") else \
-        urlunparse((p0.scheme, p0.netloc, principal_href, "", "", ""))
-
-    # Get calendar-home-set from principal
-    r2 = _requests.request(
-        "PROPFIND", principal_url,
-        headers={**headers, "Depth": "0"},
-        data=b"""<?xml version="1.0"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop><c:calendar-home-set/></d:prop>
-</d:propfind>""",
-        auth=auth, allow_redirects=True, timeout=30
-    )
-    root2 = ET.fromstring(r2.text)
-    home_href = root2.findtext(".//{urn:ietf:params:xml:ns:caldav}calendar-home-set/{DAV:}href", "")
-    p1 = urlparse(r2.url)
-    cal_home = home_href if home_href.startswith("http") else \
-        urlunparse((p1.scheme, p1.netloc, home_href, "", "", ""))
-
-    result["principal"] = principal_url
-    result["calendar_home"] = cal_home
-
-    # Derive server base and user ID
-    p2 = urlparse(cal_home)
-    server = f"{p2.scheme}://{p2.netloc}"
-    user_id = p2.path.strip("/").split("/")[0]
-    user_root = f"{server}/{user_id}/"
-    result["server"] = server
-    result["user_id"] = user_id
-
-    # ── 1. PROPFIND on user root ──────────────────────────────────
-    r = _propfind(user_root, depth=1)
-    result["user_root_propfind"] = {"status": r.status_code, "collections": []}
-    if r.status_code in (200, 207):
-        cols = _parse_cols(r.text, user_root)
-        result["user_root_propfind"]["collections"] = cols
-
-    # ── 2. Try /reminders/ sibling ────────────────────────────────
-    reminders_home = f"{server}/{user_id}/reminders/"
-    r = _propfind(reminders_home, depth=1)
-    result["reminders_path"] = {"url": reminders_home, "status": r.status_code, "lists": []}
-
-    if r.status_code in (200, 207):
-        cols = _parse_cols(r.text, reminders_home)
-        for col in cols:
-            entry: Dict[str, Any] = {**col, "todos": [], "report_status": None}
-            if "VTODO" in col["components"]:
-                r2 = _report(col["url"])
-                entry["report_status"] = r2.status_code
-                if r2.status_code in (200, 207):
-                    entry["todos"] = _parse_todos(r2.text)
-            result["reminders_path"]["lists"].append(entry)
-
-    # ── 3. Try other candidate paths ─────────────────────────────
-    candidates = [
-        f"{server}/{user_id}/tasks/",
-        f"{server}/{user_id}/lists/",
-        f"{cal_home}reminders/",
-    ]
-    found_candidates = []
-    for url in candidates:
-        r = _propfind(url, depth=0)
-        if r.status_code in (200, 207):
-            found_candidates.append({"url": url, "status": r.status_code})
-    result["other_candidates"] = found_candidates
-
-    return result
-
-
+    # 2SA path
+    if not api.validate_2sa_code(code):
+        raise ValueError("2SA code invalid or expired. Try again.")
+    api.trust_session()
+    return {"status": "success", "message": "2-step verification complete. Session trusted."}
