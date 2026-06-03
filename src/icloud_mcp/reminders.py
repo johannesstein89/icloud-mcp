@@ -95,6 +95,35 @@ def _supports_vtodo(calendar: caldav.Calendar) -> bool:
         return False
 
 
+def _is_completed(parsed: Dict[str, Any]) -> bool:
+    """Return True if a parsed todo is completed."""
+    return parsed.get("status") == "COMPLETED" or bool(parsed.get("completed_at"))
+
+
+def _fetch_todos(cal: caldav.Calendar) -> list:
+    """Fetch VTODOs from an iCloud reminders list, working around iCloud quirks.
+
+    iCloud returns HTTP 500 for the filtered todos REPORT that the caldav
+    library builds when include_completed=False — it adds prop-filters on
+    COMPLETED/STATUS that iCloud's CalDAV server rejects. We always request the
+    plain VTODO comp-filter (include_completed=True) and filter completed items
+    client-side. If even that fails, fall back to enumerating objects directly.
+    """
+    try:
+        todos = cal.todos(include_completed=True)
+        logger.debug("  _fetch_todos: todos(include_completed=True) returned %d", len(todos))
+        return todos
+    except Exception as e:
+        logger.warning("  _fetch_todos: todos() failed (%s); falling back to objects()", e)
+        try:
+            objects = list(cal.objects())
+            logger.debug("  _fetch_todos: objects() fallback returned %d", len(objects))
+            return objects
+        except Exception as e2:
+            logger.error("  _fetch_todos: objects() fallback also failed — %s", e2)
+            return []
+
+
 async def list_reminder_lists(context: Context) -> List[Dict[str, Any]]:
     """List all reminder lists (CalDAV calendars that support VTODO)."""
     email, password = require_auth(context)
@@ -149,19 +178,17 @@ async def list_reminders(
     result = []
     for cal in calendars_to_search:
         logger.debug("list_reminders: querying todos in '%s' @ %s", cal.name, cal.url)
-        try:
-            try:
-                todos = cal.todos(include_completed=include_completed)
-            except TypeError:
-                todos = cal.todos()
-            logger.debug("list_reminders: got %d todo(s) from '%s'", len(todos), cal.name)
-            for todo in todos:
-                parsed = _parse_todo(todo, email, password, cal.name or "")
-                if parsed:
-                    result.append(parsed)
-        except Exception as e:
-            logger.warning("list_reminders: error querying '%s' — %s", cal.name, e)
-            continue
+        todos = _fetch_todos(cal)
+        logger.debug("list_reminders: got %d todo(s) from '%s'", len(todos), cal.name)
+        for todo in todos:
+            parsed = _parse_todo(todo, email, password, cal.name or "")
+            if not parsed:
+                continue
+            # iCloud can't filter completed items server-side, so do it here
+            if not include_completed and _is_completed(parsed):
+                logger.debug("  skipping completed todo '%s'", parsed.get("summary"))
+                continue
+            result.append(parsed)
 
     logger.debug("list_reminders: returning %d reminder(s) total", len(result))
     return result
@@ -188,13 +215,14 @@ async def create_reminder(
         all_calendars = principal.calendars()
         calendar = None
         for cal in all_calendars:
-            try:
-                cal.todos()
+            # Use the supported-components check, not cal.todos() — iCloud
+            # returns HTTP 500 on the filtered todos REPORT.
+            if _supports_vtodo(cal):
                 calendar = cal
                 logger.debug("create_reminder: auto-selected list '%s'", cal.name)
                 break
-            except Exception as e:
-                logger.debug("create_reminder: skipping '%s' — %s", cal.name, e)
+            else:
+                logger.debug("create_reminder: skipping non-VTODO list '%s'", cal.name)
                 continue
         if calendar is None:
             raise ValueError("No reminder list found. Please specify a list_id.")
