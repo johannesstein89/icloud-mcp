@@ -17,12 +17,23 @@ def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
     )
 
 
-def _parse_todo(todo, calendar_name: str = "") -> Optional[Dict[str, Any]]:
+def _parse_todo(todo, email: str, password: str, calendar_name: str = "") -> Optional[Dict[str, Any]]:
     try:
-        todo.load()
+        # Data is usually included in the REPORT response — no load() needed
         vtodo = todo.vobject_instance.vtodo
     except Exception:
-        return None
+        # Fallback: load via URL-specific client (iCloud uses numbered sub-servers
+        # like p72-caldav.icloud.com which differ from the discovery host)
+        try:
+            todo_url = str(todo.url)
+            parsed_url = urlparse(todo_url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            sub_client = caldav.DAVClient(url=base_url, username=email, password=password)
+            todo = caldav.CalendarObjectResource(client=sub_client, url=todo_url)
+            todo.load()
+            vtodo = todo.vobject_instance.vtodo
+        except Exception:
+            return None
 
     due = None
     if hasattr(vtodo, 'due') and vtodo.due:
@@ -117,7 +128,7 @@ async def list_reminders(
         try:
             todos = cal.todos(include_completed=include_completed)
             for todo in todos:
-                parsed = _parse_todo(todo, cal.name or "")
+                parsed = _parse_todo(todo, email, password, cal.name or "")
                 if parsed:
                     result.append(parsed)
         except Exception:
