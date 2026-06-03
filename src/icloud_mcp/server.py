@@ -531,7 +531,7 @@ async def email_mark_unread(
 
 
 # ============================================================================
-# Reminders Tools (pyicloud / CloudKit backend)
+# Reminders Tools (CalDAV / VTODO)
 # ============================================================================
 
 @mcp.tool()
@@ -539,8 +539,8 @@ async def reminders_list_lists(context) -> list | dict:
     """
     List all iCloud reminder lists.
 
-    Returns a list of reminder lists with their id and name.
-    If the account requires 2FA, call reminders_verify_2fa first.
+    Returns a list of reminder lists with their id (CalDAV URL) and name.
+    Uses the same app-specific password as calendar and contacts — no 2FA needed.
     """
     try:
         return await reminders.list_reminder_lists(context)
@@ -560,10 +560,8 @@ async def reminders_list(
     List reminders from all lists or a specific list.
 
     Args:
-        list_id: Reminder list name or GUID (optional, defaults to all lists)
+        list_id: Reminder list URL/ID from reminders_list_lists (optional, defaults to all lists)
         include_completed: Include completed reminders (default: False)
-
-    Note: Requires ICLOUD_PASSWORD env var (Apple ID password, not app-specific).
     """
     try:
         return await reminders.list_reminders(context, list_id, include_completed)
@@ -587,7 +585,7 @@ async def reminders_create(
 
     Args:
         summary: Reminder title
-        list_id: Target list name or GUID (optional, uses default list)
+        list_id: Target list URL/ID from reminders_list_lists (optional, uses first list)
         due: Due date/time in ISO format, e.g. "2025-12-01T10:00:00" (optional)
         description: Reminder notes (optional)
         priority: Priority 0=none, 1=high, 5=medium, 9=low (optional)
@@ -606,7 +604,7 @@ async def reminders_delete(context, reminder_id: str) -> dict:
     Delete an iCloud reminder.
 
     Args:
-        reminder_id: Reminder GUID (from reminders_list)
+        reminder_id: Reminder URL (the 'id' field from reminders_list)
     """
     try:
         return await reminders.delete_reminder(context, reminder_id)
@@ -622,29 +620,10 @@ async def reminders_complete(context, reminder_id: str) -> dict:
     Mark an iCloud reminder as completed.
 
     Args:
-        reminder_id: Reminder GUID (from reminders_list)
+        reminder_id: Reminder URL (the 'id' field from reminders_list)
     """
     try:
         return await reminders.complete_reminder(context, reminder_id)
-    except AuthenticationError as e:
-        return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
-
-
-@mcp.tool()
-async def reminders_verify_2fa(context, code: str) -> dict:
-    """
-    Complete iCloud two-factor authentication for the Reminders service.
-
-    Call any reminders tool first — if 2FA is needed, a code is automatically
-    sent to your trusted Apple device. Then call this tool with that code.
-
-    Args:
-        code: 6-digit 2FA code from your Apple device
-    """
-    try:
-        return await reminders.verify_2fa(context, code)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except Exception as e:
