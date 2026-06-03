@@ -17,13 +17,25 @@ def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
     )
 
 
+def _supports_vtodo(cal) -> bool:
+    """Return True if the calendar collection supports VTODO components."""
+    try:
+        props = cal.get_properties([
+            "{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set"
+        ])
+        return any("VTODO" in str(v) for v in props.values())
+    except Exception:
+        # Can't determine — assume yes so we don't silently miss lists
+        return True
+
+
 def _parse_todo(todo, email: str, password: str, calendar_name: str = "") -> Optional[Dict[str, Any]]:
     try:
-        # Data is usually included in the REPORT response — no load() needed
+        # Data is usually included in the REPORT response
         vtodo = todo.vobject_instance.vtodo
     except Exception:
-        # Fallback: load via URL-specific client (iCloud uses numbered sub-servers
-        # like p72-caldav.icloud.com which differ from the discovery host)
+        # Fallback: iCloud serves todos from numbered sub-servers
+        # (e.g. p72-caldav.icloud.com), load with URL-specific client
         try:
             todo_url = str(todo.url)
             parsed_url = urlparse(todo_url)
@@ -36,23 +48,23 @@ def _parse_todo(todo, email: str, password: str, calendar_name: str = "") -> Opt
             return None
 
     due = None
-    if hasattr(vtodo, 'due') and vtodo.due:
+    if hasattr(vtodo, "due") and vtodo.due:
         try:
             val = vtodo.due.value
-            due = val.isoformat() if hasattr(val, 'isoformat') else str(val)
+            due = val.isoformat() if hasattr(val, "isoformat") else str(val)
         except Exception:
             pass
 
     completed_at = None
-    if hasattr(vtodo, 'completed') and vtodo.completed:
+    if hasattr(vtodo, "completed") and vtodo.completed:
         try:
             val = vtodo.completed.value
-            completed_at = val.isoformat() if hasattr(val, 'isoformat') else str(val)
+            completed_at = val.isoformat() if hasattr(val, "isoformat") else str(val)
         except Exception:
             pass
 
     priority = None
-    if hasattr(vtodo, 'priority') and vtodo.priority:
+    if hasattr(vtodo, "priority") and vtodo.priority:
         try:
             priority = int(vtodo.priority.value)
         except Exception:
@@ -60,20 +72,20 @@ def _parse_todo(todo, email: str, password: str, calendar_name: str = "") -> Opt
 
     return {
         "id": str(todo.url),
-        "summary": str(vtodo.summary.value) if hasattr(vtodo, 'summary') and vtodo.summary else "",
-        "description": str(vtodo.description.value) if hasattr(vtodo, 'description') and vtodo.description else "",
-        "status": str(vtodo.status.value) if hasattr(vtodo, 'status') and vtodo.status else "NEEDS-ACTION",
+        "summary": str(vtodo.summary.value) if hasattr(vtodo, "summary") and vtodo.summary else "",
+        "description": str(vtodo.description.value) if hasattr(vtodo, "description") and vtodo.description else "",
+        "status": str(vtodo.status.value) if hasattr(vtodo, "status") and vtodo.status else "NEEDS-ACTION",
         "due": due,
         "completed_at": completed_at,
         "priority": priority,
         "list": calendar_name,
-        "url": str(todo.url)
+        "url": str(todo.url),
     }
 
 
 async def list_reminder_lists(context: Context) -> List[Dict[str, Any]]:
     """
-    List all reminder lists (CalDAV calendars that support VTODO).
+    List all reminder lists (CalDAV collections that support VTODO).
 
     Returns:
         List of reminder lists with id, name, and URL
@@ -81,15 +93,15 @@ async def list_reminder_lists(context: Context) -> List[Dict[str, Any]]:
     email, password = require_auth(context)
     client = _get_caldav_client(email, password)
     principal = client.principal()
-    calendars = principal.calendars()
 
     result = []
-    for cal in calendars:
-        result.append({
-            "id": str(cal.url),
-            "name": cal.name or "Unnamed List",
-            "url": str(cal.url)
-        })
+    for cal in principal.calendars():
+        if _supports_vtodo(cal):
+            result.append({
+                "id": str(cal.url),
+                "name": cal.name or "Unnamed List",
+                "url": str(cal.url),
+            })
 
     return result
 
@@ -97,13 +109,13 @@ async def list_reminder_lists(context: Context) -> List[Dict[str, Any]]:
 async def list_reminders(
     context: Context,
     list_id: Optional[str] = None,
-    include_completed: bool = False
+    include_completed: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     List reminders from a specific list or all reminder lists.
 
     Args:
-        list_id: Reminder list URL/ID (optional, defaults to reminder-named calendars)
+        list_id: Reminder list URL/ID (optional)
         include_completed: Include completed reminders (default: False)
 
     Returns:
@@ -116,16 +128,24 @@ async def list_reminders(
     if list_id:
         calendars_to_search = [caldav.Calendar(client=client, url=list_id)]
     else:
-        calendars_to_search = principal.calendars()
+        # Only query VTODO-capable collections
+        calendars_to_search = [
+            cal for cal in principal.calendars() if _supports_vtodo(cal)
+        ]
 
     result = []
     for cal in calendars_to_search:
         try:
-            todos = cal.todos(include_completed=include_completed)
+            # Fetch ALL todos without a server-side COMPLETED filter — iCloud
+            # does not reliably support that filter. Filter client-side instead.
+            todos = cal.todos(include_completed=True)
             for todo in todos:
                 parsed = _parse_todo(todo, email, password, cal.name or "")
-                if parsed:
-                    result.append(parsed)
+                if parsed is None:
+                    continue
+                if not include_completed and parsed.get("status") == "COMPLETED":
+                    continue
+                result.append(parsed)
         except Exception:
             continue
 
@@ -138,7 +158,7 @@ async def create_reminder(
     list_id: Optional[str] = None,
     due: Optional[str] = None,
     description: Optional[str] = None,
-    priority: Optional[int] = None
+    priority: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new reminder (VTODO).
@@ -160,15 +180,10 @@ async def create_reminder(
     if list_id:
         calendar = caldav.Calendar(client=client, url=list_id)
     else:
-        all_calendars = principal.calendars()
-        calendar = None
-        for cal in all_calendars:
-            try:
-                cal.todos()
-                calendar = cal
-                break
-            except Exception:
-                continue
+        calendar = next(
+            (cal for cal in principal.calendars() if _supports_vtodo(cal)),
+            None,
+        )
         if calendar is None:
             raise ValueError("No reminder list found. Please specify a list_id.")
 
@@ -197,10 +212,10 @@ async def create_reminder(
     if description:
         desc_escaped = (
             description
-            .replace('\\', '\\\\')
-            .replace(',', '\\,')
-            .replace(';', '\\;')
-            .replace('\n', '\\n')
+            .replace("\\", "\\\\")
+            .replace(",", "\\,")
+            .replace(";", "\\;")
+            .replace("\n", "\\n")
         )
         ical_lines.append(f"DESCRIPTION:{desc_escaped}")
 
@@ -223,7 +238,7 @@ async def create_reminder(
         "description": description or "",
         "priority": priority,
         "list": calendar.name,
-        "url": str(todo.url)
+        "url": str(todo.url),
     }
 
 
@@ -271,15 +286,15 @@ async def complete_reminder(context: Context, reminder_id: str) -> Dict[str, Any
     vtodo = todo.vobject_instance.vtodo
     now = datetime.now()
 
-    if hasattr(vtodo, 'status'):
-        vtodo.status.value = 'COMPLETED'
+    if hasattr(vtodo, "status"):
+        vtodo.status.value = "COMPLETED"
     else:
-        vtodo.add('status').value = 'COMPLETED'
+        vtodo.add("status").value = "COMPLETED"
 
-    if hasattr(vtodo, 'completed'):
+    if hasattr(vtodo, "completed"):
         vtodo.completed.value = now
     else:
-        vtodo.add('completed').value = now
+        vtodo.add("completed").value = now
 
     updated_ical = todo.vobject_instance.serialize()
     client.put(reminder_id, updated_ical, {"Content-Type": "text/calendar; charset=utf-8"})
@@ -288,5 +303,5 @@ async def complete_reminder(context: Context, reminder_id: str) -> Dict[str, Any
         "id": reminder_id,
         "status": "COMPLETED",
         "completed_at": now.isoformat(),
-        "url": reminder_id
+        "url": reminder_id,
     }
