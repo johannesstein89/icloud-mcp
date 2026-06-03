@@ -559,6 +559,28 @@ async def reminders_list_lists(context) -> list | dict:
 
 
 @mcp.tool()
+async def reminders_create_list(context, name: str) -> dict:
+    """
+    Create a new iCloud reminder list.
+
+    Creates a CalDAV-native (non-upgraded) list that stays accessible over
+    CalDAV. Use this when your existing lists were upgraded to the CloudKit-only
+    format and no longer appear in reminders_list_lists. The new list will show
+    a ⚠️ in the Apple Reminders app — that's expected and means it's the legacy,
+    CalDAV-readable format.
+
+    Args:
+        name: Name for the new reminder list
+    """
+    try:
+        return await reminders.create_reminder_list(context, name)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except Exception as e:
+        return {"error": str(e), "status": 500}
+
+
+@mcp.tool()
 async def reminders_list(
     context,
     list_id: str = None,

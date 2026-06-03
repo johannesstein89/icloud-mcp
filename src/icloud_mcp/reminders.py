@@ -155,6 +155,36 @@ async def list_reminder_lists(context: Context) -> List[Dict[str, Any]]:
     return result
 
 
+async def create_reminder_list(context: Context, name: str) -> Dict[str, Any]:
+    """Create a new CalDAV-native (non-upgraded) reminder list via MKCALENDAR.
+
+    Lists created in the Reminders app on modern devices are auto-upgraded to
+    the CloudKit-only format and become invisible to CalDAV. A list created here
+    via MKCALENDAR stays in the legacy CalDAV format, so reminders added to it
+    remain readable/writable through this server.
+    """
+    email, password = require_auth(context)
+    logger.debug("create_reminder_list: name='%s'", name)
+    client = _get_caldav_client(email, password)
+    principal = client.principal()
+
+    try:
+        calendar = principal.make_calendar(
+            name=name,
+            supported_calendar_component_set=["VTODO"],
+        )
+        logger.debug("create_reminder_list: created → %s", calendar.url)
+    except Exception as e:
+        logger.error("create_reminder_list: failed — %s", e)
+        raise ValueError(f"Failed to create reminder list '{name}': {e}")
+
+    return {
+        "id": str(calendar.url),
+        "name": name,
+        "url": str(calendar.url),
+    }
+
+
 async def list_reminders(
     context: Context,
     list_id: Optional[str] = None,
