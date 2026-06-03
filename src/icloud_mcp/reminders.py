@@ -1,130 +1,140 @@
-"""iCloud Reminders management via pyicloud (CloudKit backend)."""
+"""CalDAV tools for iCloud Reminders management."""
 
-import os
-import logging
+import caldav
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 from fastmcp import Context
 from .auth import require_auth
-
-logger = logging.getLogger(__name__)
-
-COOKIE_DIR = os.environ.get("PYICLOUD_COOKIE_DIR", "/tmp/pyicloud_cookies")
-
-# Module-level cache so the same authenticated API instance is reused
-# within the process lifetime (important for the 2FA verification flow).
-_api_cache: Dict[str, Any] = {}
+from .config import config
 
 
-def _apple_password(fallback: str) -> str:
-    """Return the Apple ID password for pyicloud.
-
-    pyicloud requires the real Apple ID password, not an app-specific one.
-    Set ICLOUD_PASSWORD to override; otherwise the provided credential is used.
-    """
-    return os.environ.get("ICLOUD_PASSWORD") or fallback
-
-
-def _get_api(email: str, password: str):
-    """Return an authenticated PyiCloudService, raising ValueError if 2FA is needed."""
-    from pyicloud import PyiCloudService
-
-    os.makedirs(COOKIE_DIR, exist_ok=True)
-    apple_pw = _apple_password(password)
-
-    cached = _api_cache.get(email)
-    if cached is not None and not cached.requires_2fa and not cached.requires_2sa:
-        return cached
-
-    api = PyiCloudService(email, apple_pw, cookie_directory=COOKIE_DIR)
-    _api_cache[email] = api
-
-    if api.requires_2fa:
-        raise ValueError(
-            "2FA_REQUIRED: iCloud requires two-factor authentication. "
-            "A 6-digit code was sent to your trusted Apple device. "
-            "Call reminders_verify_2fa with that code."
-        )
-    if api.requires_2sa:
-        raise ValueError(
-            "2SA_REQUIRED: iCloud requires two-step verification. "
-            "A code was sent to your trusted device or phone. "
-            "Call reminders_verify_2fa with that code."
-        )
-
-    return api
+def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
+    return caldav.DAVClient(
+        url=config.CALDAV_SERVER,
+        username=email,
+        password=password
+    )
 
 
-def _format_reminder(reminder: dict, list_name: str = "") -> Dict[str, Any]:
-    due = None
-    due_date = reminder.get("dueDate")
-    if reminder.get("hasDueDate") and due_date and isinstance(due_date, list):
+def _parse_todo(todo, email: str, password: str, calendar_name: str = "") -> Optional[Dict[str, Any]]:
+    try:
+        # Data is usually included in the REPORT response — no load() needed
+        vtodo = todo.vobject_instance.vtodo
+    except Exception:
+        # Fallback: iCloud uses numbered sub-servers (p72-caldav.icloud.com)
+        # that differ from the discovery host, so we need a URL-specific client
         try:
-            year, month, day = due_date[0], due_date[1], due_date[2]
-            hour = due_date[3] if len(due_date) > 3 else 0
-            minute = due_date[4] if len(due_date) > 4 else 0
-            due = datetime(year, month, day, hour, minute).isoformat()
+            todo_url = str(todo.url)
+            parsed_url = urlparse(todo_url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            sub_client = caldav.DAVClient(url=base_url, username=email, password=password)
+            todo = caldav.CalendarObjectResource(client=sub_client, url=todo_url)
+            todo.load()
+            vtodo = todo.vobject_instance.vtodo
+        except Exception:
+            return None
+
+    due = None
+    if hasattr(vtodo, 'due') and vtodo.due:
+        try:
+            val = vtodo.due.value
+            due = val.isoformat() if hasattr(val, 'isoformat') else str(val)
         except Exception:
             pass
 
     completed_at = None
-    completed_date = reminder.get("completedDate")
-    if reminder.get("completed") and completed_date and isinstance(completed_date, list):
+    if hasattr(vtodo, 'completed') and vtodo.completed:
         try:
-            completed_at = datetime(
-                completed_date[0], completed_date[1], completed_date[2]
-            ).isoformat()
+            val = vtodo.completed.value
+            completed_at = val.isoformat() if hasattr(val, 'isoformat') else str(val)
+        except Exception:
+            pass
+
+    priority = None
+    if hasattr(vtodo, 'priority') and vtodo.priority:
+        try:
+            priority = int(vtodo.priority.value)
         except Exception:
             pass
 
     return {
-        "id": reminder.get("guid", ""),
-        "summary": reminder.get("title", ""),
-        "description": reminder.get("description", ""),
-        "status": "COMPLETED" if reminder.get("completed") else "NEEDS-ACTION",
+        "id": str(todo.url),
+        "summary": str(vtodo.summary.value) if hasattr(vtodo, 'summary') and vtodo.summary else "",
+        "description": str(vtodo.description.value) if hasattr(vtodo, 'description') and vtodo.description else "",
+        "status": str(vtodo.status.value) if hasattr(vtodo, 'status') and vtodo.status else "NEEDS-ACTION",
         "due": due,
         "completed_at": completed_at,
-        "priority": reminder.get("priority"),
-        "list": list_name,
+        "priority": priority,
+        "list": calendar_name,
+        "url": str(todo.url)
     }
 
 
+def _supports_vtodo(calendar: caldav.Calendar) -> bool:
+    """Return True if this calendar supports VTODO (i.e. it's a Reminders list)."""
+    try:
+        components = calendar.get_supported_components()
+        return "VTODO" in components
+    except Exception:
+        return False
+
+
 async def list_reminder_lists(context: Context) -> List[Dict[str, Any]]:
-    """List all iCloud reminder lists (collections)."""
+    """
+    List all reminder lists (CalDAV calendars that support VTODO).
+
+    Returns:
+        List of reminder lists with id, name, and URL
+    """
     email, password = require_auth(context)
-    api = _get_api(email, password)
+    client = _get_caldav_client(email, password)
+    principal = client.principal()
 
     return [
-        {"id": col.get("guid", name), "name": name}
-        for name, col in api.reminders.collections.items()
+        {"id": str(cal.url), "name": cal.name or "Unnamed List", "url": str(cal.url)}
+        for cal in principal.calendars()
+        if _supports_vtodo(cal)
     ]
 
 
 async def list_reminders(
     context: Context,
     list_id: Optional[str] = None,
-    include_completed: bool = False,
+    include_completed: bool = False
 ) -> List[Dict[str, Any]]:
-    """List reminders, optionally filtered to a specific list."""
+    """
+    List reminders from a specific list or all reminder lists.
+
+    Args:
+        list_id: Reminder list URL/ID (optional, defaults to reminder-named calendars)
+        include_completed: Include completed reminders (default: False)
+
+    Returns:
+        List of reminders with details
+    """
     email, password = require_auth(context)
-    api = _get_api(email, password)
+    client = _get_caldav_client(email, password)
+    principal = client.principal()
 
     if list_id:
-        target_names = [
-            name for name, col in api.reminders.collections.items()
-            if name == list_id or col.get("guid") == list_id
-        ]
-        if not target_names:
-            raise ValueError(f"Reminder list '{list_id}' not found.")
+        calendars_to_search = [caldav.Calendar(client=client, url=list_id)]
     else:
-        target_names = list(api.reminders.collections.keys())
+        calendars_to_search = [cal for cal in principal.calendars() if _supports_vtodo(cal)]
 
     result = []
-    for name in target_names:
-        for reminder in api.reminders.get(name):
-            if not include_completed and reminder.get("completed"):
-                continue
-            result.append(_format_reminder(reminder, name))
+    for cal in calendars_to_search:
+        try:
+            try:
+                todos = cal.todos(include_completed=include_completed)
+            except TypeError:
+                todos = cal.todos()
+            for todo in todos:
+                parsed = _parse_todo(todo, email, password, cal.name or "")
+                if parsed:
+                    result.append(parsed)
+        except Exception:
+            continue
 
     return result
 
@@ -135,129 +145,156 @@ async def create_reminder(
     list_id: Optional[str] = None,
     due: Optional[str] = None,
     description: Optional[str] = None,
-    priority: Optional[int] = None,
+    priority: Optional[int] = None
 ) -> Dict[str, Any]:
-    """Create a new iCloud reminder."""
+    """
+    Create a new reminder (VTODO).
+
+    Args:
+        summary: Reminder title
+        list_id: Target reminder list URL/ID (optional)
+        due: Due date/time in ISO format, e.g. "2025-12-01T10:00:00" (optional)
+        description: Reminder notes (optional)
+        priority: Priority 1-9 (1=highest, 5=medium, 9=lowest) (optional)
+
+    Returns:
+        Created reminder details
+    """
     email, password = require_auth(context)
-    api = _get_api(email, password)
+    client = _get_caldav_client(email, password)
+    principal = client.principal()
 
-    collection_name = None
     if list_id:
-        for name, col in api.reminders.collections.items():
-            if name == list_id or col.get("guid") == list_id:
-                collection_name = name
+        calendar = caldav.Calendar(client=client, url=list_id)
+    else:
+        all_calendars = principal.calendars()
+        # Find first calendar that supports VTODO
+        calendar = None
+        for cal in all_calendars:
+            try:
+                cal.todos()
+                calendar = cal
                 break
-        if collection_name is None:
-            raise ValueError(f"Reminder list '{list_id}' not found.")
+            except Exception:
+                continue
+        if calendar is None:
+            raise ValueError("No reminder list found. Please specify a list_id.")
 
-    due_date = datetime.fromisoformat(due) if due else None
+    now = datetime.now()
+    uid = f"{int(now.timestamp())}{now.microsecond}@icloud-mcp"
 
-    api.reminders.post(
-        subject=summary,
-        description=description or "",
-        collection=collection_name,
-        due_date=due_date,
-    )
+    ical_lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//iCloud MCP//EN",
+        "CALSCALE:GREGORIAN",
+        "BEGIN:VTODO",
+        f"UID:{uid}",
+        f"DTSTAMP:{now.strftime('%Y%m%dT%H%M%SZ')}",
+        f"CREATED:{now.strftime('%Y%m%dT%H%M%SZ')}",
+        f"LAST-MODIFIED:{now.strftime('%Y%m%dT%H%M%SZ')}",
+        f"SUMMARY:{summary}",
+        "STATUS:NEEDS-ACTION",
+        "SEQUENCE:0",
+    ]
 
-    default_list = collection_name or (
-        next(iter(api.reminders.collections), "") if api.reminders.collections else ""
-    )
+    if due:
+        due_dt = datetime.fromisoformat(due)
+        ical_lines.append(f"DUE:{due_dt.strftime('%Y%m%dT%H%M%S')}")
+
+    if description:
+        desc_escaped = (
+            description
+            .replace('\\', '\\\\')
+            .replace(',', '\\,')
+            .replace(';', '\\;')
+            .replace('\n', '\\n')
+        )
+        ical_lines.append(f"DESCRIPTION:{desc_escaped}")
+
+    if priority is not None:
+        ical_lines.append(f"PRIORITY:{priority}")
+
+    ical_lines += ["END:VTODO", "END:VCALENDAR"]
+    ical_data = "\r\n".join(ical_lines)
+
+    try:
+        todo = calendar.add_todo(ical_data)
+    except Exception as e:
+        raise ValueError(f"Failed to create reminder in list '{calendar.name}': {str(e)}")
+
     return {
+        "id": str(todo.url),
         "summary": summary,
-        "description": description or "",
         "status": "NEEDS-ACTION",
         "due": due or "",
-        "list": default_list,
+        "description": description or "",
+        "priority": priority,
+        "list": calendar.name,
+        "url": str(todo.url)
     }
 
 
-def _find_reminder(api, reminder_id: str):
-    """Return (reminder_dict, list_name) or raise ValueError."""
-    for name in api.reminders.collections:
-        for r in api.reminders.get(name):
-            if r.get("guid") == reminder_id:
-                return dict(r), name
-    raise ValueError(f"Reminder '{reminder_id}' not found.")
-
-
 async def delete_reminder(context: Context, reminder_id: str) -> Dict[str, str]:
-    """Delete an iCloud reminder by GUID."""
+    """
+    Delete a reminder.
+
+    Args:
+        reminder_id: Reminder URL/ID to delete
+
+    Returns:
+        Confirmation message
+    """
     email, password = require_auth(context)
-    api = _get_api(email, password)
 
-    reminder, _ = _find_reminder(api, reminder_id)
+    parsed = urlparse(reminder_id)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    client = caldav.DAVClient(url=base_url, username=email, password=password)
 
-    params = dict(api.reminders._params)
-    params.update({"clientVersion": "4.0", "lang": "en-us"})
+    todo = caldav.CalendarObjectResource(client=client, url=reminder_id)
+    todo.delete()
 
-    resp = api.reminders._session.delete(
-        api.reminders._service_root + "/rd/reminder",
-        params=params,
-        json={"Reminders": {"guid": reminder_id, "pGuid": reminder.get("pGuid", "")}},
-    )
-
-    if resp.status_code not in (200, 204):
-        raise ValueError(f"Delete failed: HTTP {resp.status_code} — {resp.text[:200]}")
-
-    return {"status": "success", "message": "Reminder deleted."}
+    return {"status": "success", "message": f"Reminder {reminder_id} deleted"}
 
 
 async def complete_reminder(context: Context, reminder_id: str) -> Dict[str, Any]:
-    """Mark an iCloud reminder as completed."""
+    """
+    Mark a reminder as completed.
+
+    Args:
+        reminder_id: Reminder URL/ID to mark as complete
+
+    Returns:
+        Updated reminder details
+    """
     email, password = require_auth(context)
-    api = _get_api(email, password)
 
-    reminder, list_name = _find_reminder(api, reminder_id)
+    parsed = urlparse(reminder_id)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    client = caldav.DAVClient(url=base_url, username=email, password=password)
 
+    todo = caldav.CalendarObjectResource(client=client, url=reminder_id)
+    todo.load()
+
+    vtodo = todo.vobject_instance.vtodo
     now = datetime.now()
-    reminder["completed"] = True
-    reminder["completedDate"] = [now.year, now.month, now.day, now.hour, now.minute]
 
-    params = dict(api.reminders._params)
-    params.update({"clientVersion": "4.0", "lang": "en-us"})
+    if hasattr(vtodo, 'status'):
+        vtodo.status.value = 'COMPLETED'
+    else:
+        vtodo.add('status').value = 'COMPLETED'
 
-    resp = api.reminders._session.post(
-        api.reminders._service_root + "/rd/reminders",
-        params=params,
-        json={"Reminders": [reminder]},
-    )
+    if hasattr(vtodo, 'completed'):
+        vtodo.completed.value = now
+    else:
+        vtodo.add('completed').value = now
 
-    if resp.status_code not in (200, 204):
-        raise ValueError(f"Complete failed: HTTP {resp.status_code} — {resp.text[:200]}")
+    updated_ical = todo.vobject_instance.serialize()
+    client.put(reminder_id, updated_ical, {"Content-Type": "text/calendar; charset=utf-8"})
 
     return {
         "id": reminder_id,
         "status": "COMPLETED",
         "completed_at": now.isoformat(),
-        "list": list_name,
+        "url": reminder_id
     }
-
-
-async def verify_2fa(context: Context, code: str) -> Dict[str, str]:
-    """Submit a 2FA/2SA code to complete iCloud authentication."""
-    email, password = require_auth(context)
-    from pyicloud import PyiCloudService
-
-    os.makedirs(COOKIE_DIR, exist_ok=True)
-    apple_pw = _apple_password(password)
-
-    # Reuse cached instance so we verify against the same auth challenge.
-    api = _api_cache.get(email)
-    if api is None:
-        api = PyiCloudService(email, apple_pw, cookie_directory=COOKIE_DIR)
-        _api_cache[email] = api
-
-    if not api.requires_2fa and not api.requires_2sa:
-        return {"status": "ok", "message": "Already authenticated — no 2FA needed."}
-
-    if api.requires_2fa:
-        if not api.validate_2fa_code(code):
-            raise ValueError("2FA code invalid or expired. Try again.")
-        api.trust_session()
-        return {"status": "success", "message": "2FA verified. Session trusted."}
-
-    # 2SA path
-    if not api.validate_2sa_code(code):
-        raise ValueError("2SA code invalid or expired. Try again.")
-    api.trust_session()
-    return {"status": "success", "message": "2-step verification complete. Session trusted."}
