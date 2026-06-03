@@ -320,3 +320,173 @@ async def complete_reminder(context: Context, reminder_id: str) -> Dict[str, Any
         "completed_at": now.isoformat(),
         "url": reminder_id,
     }
+
+
+async def debug_reminders(context: Context) -> Dict[str, Any]:
+    """
+    Diagnostic tool: raw CalDAV discovery and VTODO fetch test.
+
+    Returns detailed information about all CalDAV collections, their
+    supported component types, and the raw REPORT results per list.
+    Useful for diagnosing why reminders are not visible.
+    """
+    import requests as _requests
+    from xml.etree import ElementTree as ET
+
+    email, password = require_auth(context)
+    auth = (email, password)
+    result: Dict[str, Any] = {"steps": {}}
+
+    def _propfind(url, depth, body):
+        return _requests.request(
+            "PROPFIND", url,
+            headers={"Content-Type": "application/xml; charset=utf-8",
+                     "Depth": str(depth)},
+            data=body, auth=auth, allow_redirects=True, timeout=30
+        )
+
+    # ── 1. Principal ──────────────────────────────────────────────
+    r = _propfind(config.CALDAV_SERVER, 0, b"""<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:current-user-principal/></d:prop>
+</d:propfind>""")
+    root = ET.fromstring(r.text)
+    href = root.find(".//{DAV:}current-user-principal/{DAV:}href")
+    if href is None:
+        return {"error": "Cannot find principal", "raw": r.text[:500]}
+
+    p = urlparse(r.url)
+    principal_path = href.text
+    if principal_path.startswith("http"):
+        principal_url = principal_path
+    else:
+        from urllib.parse import urlunparse
+        principal_url = urlunparse((p.scheme, p.netloc, principal_path, "", "", ""))
+    result["steps"]["principal"] = principal_url
+
+    # ── 2. Calendar home set ──────────────────────────────────────
+    r = _propfind(principal_url, 0, b"""<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><c:calendar-home-set/></d:prop>
+</d:propfind>""")
+    root = ET.fromstring(r.text)
+    href = root.find(".//{urn:ietf:params:xml:ns:caldav}calendar-home-set/{DAV:}href")
+    if href is None:
+        return {"error": "Cannot find calendar-home-set", "raw": r.text[:500]}
+
+    home_path = href.text
+    p2 = urlparse(r.url)
+    if home_path.startswith("http"):
+        home_url = home_path
+    else:
+        from urllib.parse import urlunparse
+        home_url = urlunparse((p2.scheme, p2.netloc, home_path, "", "", ""))
+    result["steps"]["calendar_home"] = home_url
+
+    # ── 3. List all collections ───────────────────────────────────
+    r = _propfind(home_url, 1, b"""<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:displayname/>
+    <d:resourcetype/>
+    <c:supported-calendar-component-set/>
+  </d:prop>
+</d:propfind>""")
+    root = ET.fromstring(r.text)
+    collections = []
+    for resp in root.findall("{DAV:}response"):
+        href_el = resp.find("{DAV:}href")
+        col_url = href_el.text if href_el is not None else ""
+        name_el = resp.find(".//{DAV:}displayname")
+        name = name_el.text if name_el is not None else ""
+        comp_set = resp.find(".//{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set")
+        components = [c.get("name") for c in comp_set] if comp_set is not None else []
+        is_cal = resp.find(".//{urn:ietf:params:xml:ns:caldav}calendar") is not None
+        collections.append({
+            "name": name, "url": col_url,
+            "components": components, "is_calendar": is_cal
+        })
+    result["steps"]["collections"] = collections
+
+    # ── 4. Fetch VTODOs from each VTODO-capable collection ───────
+    from urllib.parse import urlunparse as _uu
+    p3 = urlparse(home_url)
+    base = f"{p3.scheme}://{p3.netloc}"
+
+    vtodo_cols = [c for c in collections if "VTODO" in c["components"]]
+    if not vtodo_cols:
+        vtodo_cols = [c for c in collections if c["is_calendar"]]
+
+    report_body = b"""<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VTODO"/>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>"""
+
+    todos_by_list = []
+    for col in vtodo_cols:
+        col_url = col["url"]
+        if not col_url.startswith("http"):
+            col_url = base + col_url
+
+        r = _requests.request(
+            "REPORT", col_url,
+            headers={"Content-Type": "application/xml; charset=utf-8", "Depth": "1"},
+            data=report_body, auth=auth, allow_redirects=True, timeout=30
+        )
+        todos = []
+        if r.status_code in (200, 207):
+            try:
+                rroot = ET.fromstring(r.text)
+                for rresp in rroot.findall("{DAV:}response"):
+                    cal_data = rresp.find(
+                        ".//{urn:ietf:params:xml:ns:caldav}calendar-data")
+                    if cal_data is not None and cal_data.text:
+                        fields = {}
+                        in_todo = False
+                        for line in cal_data.text.splitlines():
+                            if line.strip() == "BEGIN:VTODO":
+                                in_todo = True
+                            elif line.strip() == "END:VTODO":
+                                break
+                            elif in_todo and ":" in line:
+                                k, _, v = line.partition(":")
+                                fields[k.split(";")[0]] = v
+                        todos.append({
+                            "summary": fields.get("SUMMARY", ""),
+                            "status": fields.get("STATUS", "NEEDS-ACTION"),
+                            "due": fields.get("DUE", ""),
+                            "priority": fields.get("PRIORITY", ""),
+                            "description": fields.get("DESCRIPTION", ""),
+                            "uid": fields.get("UID", ""),
+                        })
+            except Exception as e:
+                todos_by_list.append({
+                    "list": col["name"], "url": col_url,
+                    "report_status": r.status_code,
+                    "error": str(e), "todos": []
+                })
+                continue
+        todos_by_list.append({
+            "list": col["name"], "url": col_url,
+            "report_status": r.status_code,
+            "todos_count": len(todos),
+            "todos": todos
+        })
+
+    result["steps"]["todos_by_list"] = todos_by_list
+    result["total_todos"] = sum(x.get("todos_count", 0) for x in todos_by_list)
+
+    if result["total_todos"] == 0:
+        result["diagnosis"] = (
+            "No reminders found via CalDAV. Most likely cause: "
+            "Reminders are not synced to iCloud. "
+            "Check: iPhone → Settings → [Name] → iCloud → Reminders → ON"
+        )
+
+    return result
+

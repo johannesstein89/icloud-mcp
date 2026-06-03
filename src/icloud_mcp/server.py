@@ -629,6 +629,24 @@ async def reminders_complete(context, reminder_id: str) -> dict:
         return {"error": str(e), "status": 500}
 
 
+@mcp.tool()
+async def reminders_debug(context) -> dict:
+    """
+    Diagnostic tool for iCloud Reminders.
+
+    Performs raw CalDAV discovery and VTODO REPORT requests, bypassing
+    the caldav library abstraction. Returns detailed information about
+    all collections, their supported component types, and the actual
+    VTODOs found per list — useful for diagnosing sync issues.
+    """
+    try:
+        return await reminders.debug_reminders(context)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except Exception as e:
+        return {"error": str(e), "status": 500}
+
+
 # ============================================================================
 # Server Entrypoint
 # ============================================================================
